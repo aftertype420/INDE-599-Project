@@ -1,0 +1,11 @@
+model,metric_level,precision,recall,f1_score,support
+"Logistic Regression, C=1.0",Non-failure class (0),0.9908312958435208,0.8390269151138716,0.9086322869955157,1932.0
+"Logistic Regression, C=1.0",Failure class (1),0.14560439560439561,0.7794117647058824,0.24537037037037038,68.0
+"Logistic Regression, C=1.0",macro avg,0.5682178457239582,0.809219339909877,0.5770013286829431,2000.0
+"Logistic Regression, C=1.0",weighted avg,0.9620935812353906,0.837,0.8860813818302608,2000.0
+"Logistic Regression, C=1.0",accuracy,,,0.837,2000.0
+"Random Forest, depth=10, leaf=2",Non-failure class (0),0.9855595667870036,0.9891304347826086,0.9873417721518988,1932.0
+"Random Forest, depth=10, leaf=2",Failure class (1),0.6557377049180327,0.5882352941176471,0.6201550387596899,68.0
+"Random Forest, depth=10, leaf=2",macro avg,0.8206486358525182,0.7886828644501278,0.8037484054557944,2000.0
+"Random Forest, depth=10, leaf=2",weighted avg,0.9743456234834587,0.9755,0.9748574232165637,2000.0
+"Random Forest, depth=10, leaf=2",accuracy,,,0.9755,2000.0
