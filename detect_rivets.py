@@ -1,35 +1,23 @@
 #!/usr/bin/env python3
-"""AI-Based Detection of Low-Contrast Rivets - Midterm Baseline.
+"""AI-Based Detection of Low-Contrast Rivets - Midterm Baseline + Optional AI/GPU.
 
 This script detects low-contrast rivets on a same-color 3D printed base.
-It is designed for prototype images where the rivets are mostly circular and
-mounted in a row on the front face of the blue base.
-
-Pipeline:
-1. Load image.
-2. Resize for consistent processing.
-3. Automatically find the blue object using HSV color thresholding.
-4. Crop the front-face / rivet-row region of interest.
-5. Enhance low-contrast edges using CLAHE and background correction.
-6. Detect circular rivets using Hough Circle Transform.
-7. Merge duplicate detections using non-maximum suppression.
-8. Keep detections that lie on the rivet row.
-9. Draw rivet boundaries and center points.
-
-Install:
-    pip install opencv-python numpy
+It supports:
+- Classical OpenCV baseline pipeline.
+- Optional AI/GPU preprocessing via PyTorch (--ai-preprocess, --device cuda).
 
 Example:
-    python detect_rivets.py --image "C:/Users/Will/Downloads/Photos-3-001/20260503_230647.jpg" --debug
-
-Folder mode:
-    python detect_rivets.py --folder "C:/Users/Will/Downloads/Photos-3-001" --output outputs --debug
+    python detect_rivets.py --folder "C:/Users/Will/Desktop/INDE 599/Photos-3-001" --output outputs --debug
+    python detect_rivets.py --folder "C:/Users/Will/Desktop/INDE 599/Photos-3-001" --output outputs --debug --ai-preprocess --device cuda
 """
+
 
 from __future__ import annotations
 
 import argparse
 import csv
+import importlib
+import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -40,6 +28,8 @@ import numpy as np
 
 @dataclass
 class Detection:
+    """One rivet detection in ROI coordinates."""
+
     x: float
     y: float
     r: float
@@ -49,6 +39,8 @@ class Detection:
 
 @dataclass
 class DetectionResult:
+    """Final result for one processed image."""
+
     image_path: Path
     output_path: Path
     detections: list[Detection]
@@ -60,6 +52,7 @@ def resize_keep_aspect(image: np.ndarray, max_width: int) -> tuple[np.ndarray, f
     h, w = image.shape[:2]
     if w <= max_width:
         return image.copy(), 1.0
+
     scale = max_width / float(w)
     new_size = (max_width, int(round(h * scale)))
     resized = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
@@ -71,6 +64,7 @@ def find_blue_object_roi(
     front_band: tuple[float, float] = (0.18, 0.88),
 ) -> tuple[tuple[int, int, int, int], np.ndarray]:
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
     lower_blue = np.array([85, 35, 20], dtype=np.uint8)
     upper_blue = np.array([145, 255, 255], dtype=np.uint8)
     mask = cv2.inRange(hsv, lower_blue, upper_blue)
@@ -120,6 +114,39 @@ def preprocess_roi(roi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray,
     return enhanced, corrected, blurred, edges
 
 
+def preprocess_roi_torch(roi: np.ndarray, use_cuda: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Optional AI/GPU preprocessing path using PyTorch tensors.
+
+    Returns same outputs as preprocess_roi for downstream compatibility.
+    """
+    torch_spec = importlib.util.find_spec("torch")
+    if torch_spec is None:
+        return preprocess_roi(roi)
+
+    torch = importlib.import_module("torch")
+    F = importlib.import_module("torch.nn.functional")
+    device = torch.device("cuda" if (use_cuda and torch.cuda.is_available()) else "cpu")
+
+    img = torch.from_numpy(roi).to(device=device, dtype=torch.float32) / 255.0
+    b, g, r = img[..., 0], img[..., 1], img[..., 2]
+    gray = (0.114 * b + 0.587 * g + 0.299 * r).unsqueeze(0).unsqueeze(0)
+
+    coords = torch.arange(5, dtype=torch.float32, device=device) - 2.0
+    gk = torch.exp(-(coords**2) / (2 * 1.2 * 1.2))
+    gk = gk / gk.sum()
+    kernel = torch.outer(gk, gk).unsqueeze(0).unsqueeze(0)
+    blurred_t = F.conv2d(F.pad(gray, (2, 2, 2, 2), mode="reflect"), kernel)
+
+    corrected_t = (gray - blurred_t).clamp(0.0, 1.0)
+    corrected_u8 = corrected_t.squeeze().mul(255.0).byte().cpu().numpy()
+    enhanced = cv2.normalize(corrected_u8, None, 0, 255, cv2.NORM_MINMAX)
+    blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
+    edges = cv2.Canny(blurred, 40, 120)
+
+    gray_u8 = gray.squeeze().mul(255.0).byte().cpu().numpy()
+    return gray_u8, enhanced, blurred, edges
+
+
 def circle_score(edges: np.ndarray, gray: np.ndarray, x: float, y: float, r: float) -> float:
     h, w = edges.shape[:2]
     x_i, y_i, r_i = int(round(x)), int(round(y)), int(round(r))
@@ -146,7 +173,11 @@ def circle_score(edges: np.ndarray, gray: np.ndarray, x: float, y: float, r: flo
 
     inner_vals = gray[inner > 0]
     outer_vals = gray[outer > 0]
-    contrast = 0.0 if len(inner_vals) == 0 or len(outer_vals) == 0 else abs(float(np.mean(inner_vals)) - float(np.mean(outer_vals))) / 255.0
+    if len(inner_vals) == 0 or len(outer_vals) == 0:
+        contrast = 0.0
+    else:
+        contrast = abs(float(np.mean(inner_vals)) - float(np.mean(outer_vals))) / 255.0
+
     return float(0.8 * edge_support + 0.2 * contrast)
 
 
@@ -183,12 +214,25 @@ def hough_circle_candidates(
 
         for cx, cy, radius in np.round(circles[0]).astype(int):
             score = circle_score(edges, blurred, cx, cy, radius)
-            candidates.append(Detection(float(cx), float(cy), float(radius), score, f"hough_p2_{votes}"))
+            candidates.append(
+                Detection(
+                    x=float(cx),
+                    y=float(cy),
+                    r=float(radius),
+                    score=score,
+                    method=f"hough_p2_{votes}",
+                )
+            )
 
     return candidates
 
 
-def contour_ellipse_candidates(edges: np.ndarray, gray: np.ndarray, min_radius: int, max_radius: int) -> list[Detection]:
+def contour_ellipse_candidates(
+    edges: np.ndarray,
+    gray: np.ndarray,
+    min_radius: int,
+    max_radius: int,
+) -> list[Detection]:
     candidates: list[Detection] = []
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     processed_edges = cv2.dilate(edges, kernel, iterations=1)
@@ -198,17 +242,29 @@ def contour_ellipse_candidates(edges: np.ndarray, gray: np.ndarray, min_radius: 
         area = cv2.contourArea(contour)
         if area < (min_radius**2) * 0.15 or area > (max_radius**2) * 6.0:
             continue
+
         x, y, w, h = cv2.boundingRect(contour)
-        if w < min_radius or h < min_radius or w > max_radius * 3 or h > max_radius * 3:
+        if w < min_radius or h < min_radius:
             continue
+        if w > max_radius * 3 or h > max_radius * 3:
+            continue
+
         aspect = w / float(h)
-        if not (0.45 <= aspect <= 2.2) or len(contour) < 5:
+        if not (0.45 <= aspect <= 2.2):
+            continue
+
+        if len(contour) < 5:
             continue
 
         (cx, cy), (axis_a, axis_b), _angle = cv2.fitEllipse(contour)
         major = max(axis_a, axis_b)
         minor = min(axis_a, axis_b)
-        if major < min_radius or major > max_radius * 2.5 or minor < min_radius * 0.6 or major / max(minor, 1.0) > 2.5:
+
+        if major < min_radius or major > max_radius * 2.5:
+            continue
+        if minor < min_radius * 0.6:
+            continue
+        if major / max(minor, 1.0) > 2.5:
             continue
 
         radius = (major + minor) / 4.0
@@ -218,11 +274,18 @@ def contour_ellipse_candidates(edges: np.ndarray, gray: np.ndarray, min_radius: 
     return candidates
 
 
-def non_max_suppression(candidates: Iterable[Detection], score_threshold: float, merge_factor: float, merge_min_distance: float) -> list[Detection]:
+def non_max_suppression(
+    candidates: Iterable[Detection],
+    score_threshold: float,
+    merge_factor: float,
+    merge_min_distance: float,
+) -> list[Detection]:
     kept: list[Detection] = []
+
     for candidate in sorted(candidates, key=lambda d: d.score, reverse=True):
         if candidate.score < score_threshold:
             continue
+
         duplicate = False
         for existing in kept:
             distance = np.hypot(candidate.x - existing.x, candidate.y - existing.y)
@@ -230,17 +293,23 @@ def non_max_suppression(candidates: Iterable[Detection], score_threshold: float,
             if distance < merge_distance:
                 duplicate = True
                 break
+
         if not duplicate:
             kept.append(candidate)
+
     return kept
 
 
-def filter_detections_by_row(detections: list[Detection], row_tolerance: Optional[float] = None) -> list[Detection]:
+def filter_detections_by_row(
+    detections: list[Detection],
+    row_tolerance: Optional[float] = None,
+) -> list[Detection]:
     if len(detections) < 4:
         return detections
 
     ys = np.array([d.y for d in detections], dtype=float)
     radii = np.array([d.r for d in detections], dtype=float)
+
     median_y = float(np.median(ys))
     median_r = float(max(10.0, np.median(radii)))
 
@@ -258,7 +327,13 @@ def filter_detections_by_row(detections: list[Detection], row_tolerance: Optiona
         return detections
 
     tolerance = row_tolerance if row_tolerance is not None else max(35.0, 1.35 * median_r)
-    filtered = [d for d in detections if abs(d.y - (slope * d.x + intercept)) <= tolerance]
+
+    filtered = []
+    for d in detections:
+        predicted_y = slope * d.x + intercept
+        if abs(d.y - predicted_y) <= tolerance:
+            filtered.append(d)
+
     return filtered if len(filtered) >= 3 else detections
 
 
@@ -274,7 +349,12 @@ def parse_roi_string(roi_text: str) -> tuple[int, int, int, int]:
 
 
 def choose_roi_interactively(image: np.ndarray) -> tuple[int, int, int, int]:
-    roi = cv2.selectROI("Select rivet row ROI, then press ENTER. Press ESC to cancel.", image, showCrosshair=True, fromCenter=False)
+    roi = cv2.selectROI(
+        "Select rivet row ROI, then press ENTER. Press ESC to cancel.",
+        image,
+        showCrosshair=True,
+        fromCenter=False,
+    )
     cv2.destroyAllWindows()
     x, y, w, h = [int(v) for v in roi]
     if w <= 0 or h <= 0:
@@ -282,7 +362,15 @@ def choose_roi_interactively(image: np.ndarray) -> tuple[int, int, int, int]:
     return x, y, w, h
 
 
-def save_debug_images(debug_dir: Path, stem: str, blue_mask: np.ndarray, roi: np.ndarray, enhanced: np.ndarray, corrected: np.ndarray, edges: np.ndarray) -> None:
+def save_debug_images(
+    debug_dir: Path,
+    stem: str,
+    blue_mask: np.ndarray,
+    roi: np.ndarray,
+    enhanced: np.ndarray,
+    corrected: np.ndarray,
+    edges: np.ndarray,
+) -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(debug_dir / f"{stem}_01_blue_mask.png"), blue_mask)
     cv2.imwrite(str(debug_dir / f"{stem}_02_roi.png"), roi)
@@ -291,7 +379,12 @@ def save_debug_images(debug_dir: Path, stem: str, blue_mask: np.ndarray, roi: np
     cv2.imwrite(str(debug_dir / f"{stem}_05_edges.png"), edges)
 
 
-def annotate_image(image: np.ndarray, detections: list[Detection], roi_xywh: tuple[int, int, int, int], show_coords: bool) -> np.ndarray:
+def annotate_image(
+    image: np.ndarray,
+    detections: list[Detection],
+    roi_xywh: tuple[int, int, int, int],
+    show_coords: bool,
+) -> np.ndarray:
     output = image.copy()
     x0, y0, w, h = roi_xywh
     cv2.rectangle(output, (x0, y0), (x0 + w, y0 + h), (255, 255, 0), 2)
@@ -300,12 +393,25 @@ def annotate_image(image: np.ndarray, detections: list[Detection], roi_xywh: tup
         cx = int(round(x0 + d.x))
         cy = int(round(y0 + d.y))
         radius = int(round(d.r))
+
         cv2.circle(output, (cx, cy), radius, (0, 255, 0), 2)
         cv2.circle(output, (cx, cy), 4, (0, 0, 255), -1)
 
-        label = f"{idx}:({cx},{cy})" if show_coords else str(idx)
+        label = str(idx)
+        if show_coords:
+            label = f"{idx}:({cx},{cy})"
+
         label_y = max(20, cy - radius - 6)
-        cv2.putText(output, label, (max(0, cx - 10), label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(
+            output,
+            label,
+            (max(0, cx - 10), label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
     return output
 
@@ -314,32 +420,57 @@ def write_centers_csv(csv_path: Path, results: list[DetectionResult]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["image", "rivet_number", "center_x_resized", "center_y_resized", "center_x_original", "center_y_original", "radius_resized", "radius_original", "score", "method"])
+        writer.writerow(
+            [
+                "image",
+                "rivet_number",
+                "center_x_resized",
+                "center_y_resized",
+                "center_x_original",
+                "center_y_original",
+                "radius_resized",
+                "radius_original",
+                "score",
+                "method",
+            ]
+        )
+
         for result in results:
             x0, y0, _, _ = result.roi_xywh
             for idx, d in enumerate(sorted(result.detections, key=lambda det: det.x), start=1):
                 cx_resized = x0 + d.x
                 cy_resized = y0 + d.y
-                writer.writerow([
-                    result.image_path.name,
-                    idx,
-                    round(cx_resized, 2),
-                    round(cy_resized, 2),
-                    round(cx_resized / result.scale, 2),
-                    round(cy_resized / result.scale, 2),
-                    round(d.r, 2),
-                    round(d.r / result.scale, 2),
-                    round(d.score, 4),
-                    d.method,
-                ])
+                cx_original = cx_resized / result.scale
+                cy_original = cy_resized / result.scale
+                radius_original = d.r / result.scale
+
+                writer.writerow(
+                    [
+                        result.image_path.name,
+                        idx,
+                        round(cx_resized, 2),
+                        round(cy_resized, 2),
+                        round(cx_original, 2),
+                        round(cy_original, 2),
+                        round(d.r, 2),
+                        round(radius_original, 2),
+                        round(d.score, 4),
+                        d.method,
+                    ]
+                )
 
 
-def detect_rivets_in_image(image_path: Path, output_path: Path, args: argparse.Namespace) -> DetectionResult:
+def detect_rivets_in_image(
+    image_path: Path,
+    output_path: Path,
+    args: argparse.Namespace,
+) -> DetectionResult:
     original = cv2.imread(str(image_path))
     if original is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
 
     image, scale = resize_keep_aspect(original, args.max_width)
+
     if args.roi is not None:
         roi_xywh = args.roi
         blue_mask = np.zeros(image.shape[:2], dtype=np.uint8)
@@ -357,15 +488,43 @@ def detect_rivets_in_image(image_path: Path, output_path: Path, args: argparse.N
     roi_xywh = (x0, y0, w, h)
 
     roi = image[y0 : y0 + h, x0 : x0 + w]
-    enhanced, corrected, blurred, edges = preprocess_roi(roi)
 
-    candidates = hough_circle_candidates(blurred, edges, args.min_radius, args.max_radius, args.hough_votes, args.multi_pass)
+    if args.ai_preprocess:
+        enhanced, corrected, blurred, edges = preprocess_roi_torch(
+            roi, use_cuda=(args.device in {"auto", "cuda"})
+        )
+    else:
+        enhanced, corrected, blurred, edges = preprocess_roi(roi)
+
+    candidates = hough_circle_candidates(
+        blurred=blurred,
+        edges=edges,
+        min_radius=args.min_radius,
+        max_radius=args.max_radius,
+        hough_votes=args.hough_votes,
+        multi_pass=args.multi_pass,
+    )
+
     if args.use_ellipse_fallback:
-        candidates.extend(contour_ellipse_candidates(edges, blurred, args.min_radius, args.max_radius))
+        candidates.extend(
+            contour_ellipse_candidates(
+                edges=edges,
+                gray=blurred,
+                min_radius=args.min_radius,
+                max_radius=args.max_radius,
+            )
+        )
 
-    detections = non_max_suppression(candidates, args.score_threshold, args.merge_factor, args.merge_min_distance)
+    detections = non_max_suppression(
+        candidates,
+        score_threshold=args.score_threshold,
+        merge_factor=args.merge_factor,
+        merge_min_distance=args.merge_min_distance,
+    )
+
     if not args.no_row_filter:
         detections = filter_detections_by_row(detections, row_tolerance=args.row_tolerance)
+
     detections = sorted(detections, key=lambda d: d.x)
 
     annotated = annotate_image(image, detections, roi_xywh, show_coords=args.show_coords)
@@ -373,9 +532,17 @@ def detect_rivets_in_image(image_path: Path, output_path: Path, args: argparse.N
     cv2.imwrite(str(output_path), annotated)
 
     if args.debug:
-        save_debug_images(output_path.parent / "debug", image_path.stem, blue_mask, roi, enhanced, corrected, edges)
+        debug_dir = output_path.parent / "debug"
+        save_debug_images(debug_dir, image_path.stem, blue_mask, roi, enhanced, corrected, edges)
 
-    result = DetectionResult(image_path, output_path, detections, roi_xywh, scale)
+    result = DetectionResult(
+        image_path=image_path,
+        output_path=output_path,
+        detections=detections,
+        roi_xywh=roi_xywh,
+        scale=scale,
+    )
+
     print_detection_summary(result)
     return result
 
@@ -385,16 +552,27 @@ def print_detection_summary(result: DetectionResult) -> None:
     print(f"\nImage: {result.image_path.name}")
     print(f"Output: {result.output_path}")
     print(f"Detected rivets: {len(result.detections)}")
+
     if not result.detections:
         print("No rivets detected. Try lowering --hough-votes or using --select-roi.")
         return
 
     print("# | center resized (x,y) | center original (x,y) | radius original | score")
     print("--|----------------------|-----------------------|-----------------|------")
+
     for idx, d in enumerate(sorted(result.detections, key=lambda det: det.x), start=1):
         cx_resized = x0 + d.x
         cy_resized = y0 + d.y
-        print(f"{idx:2d}| ({cx_resized:7.1f}, {cy_resized:7.1f}) | ({(cx_resized / result.scale):7.1f}, {(cy_resized / result.scale):7.1f}) | {(d.r / result.scale):7.1f} | {d.score:.3f}")
+        cx_original = cx_resized / result.scale
+        cy_original = cy_resized / result.scale
+        r_original = d.r / result.scale
+        print(
+            f"{idx:2d}| "
+            f"({cx_resized:7.1f}, {cy_resized:7.1f}) | "
+            f"({cx_original:7.1f}, {cy_original:7.1f}) | "
+            f"{r_original:7.1f} | "
+            f"{d.score:.3f}"
+        )
 
 
 def image_files_from_folder(folder: Path) -> list[Path]:
@@ -403,30 +581,56 @@ def image_files_from_folder(folder: Path) -> list[Path]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Detect and mark low-contrast rivet centers in still images.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description="Detect and mark low-contrast rivet centers in still images.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--image", type=Path, help="Path to one input image.")
     source.add_argument("--folder", type=Path, help="Path to a folder of images.")
 
-    parser.add_argument("--output", type=Path, default=Path("outputs"), help="Output file for --image mode, or output folder for --folder mode.")
-    parser.add_argument("--max-width", type=int, default=1280)
-    parser.add_argument("--min-radius", type=int, default=20)
-    parser.add_argument("--max-radius", type=int, default=50)
-    parser.add_argument("--hough-votes", type=int, default=22)
-    parser.add_argument("--multi-pass", action="store_true")
-    parser.add_argument("--score-threshold", type=float, default=0.06)
-    parser.add_argument("--merge-factor", type=float, default=0.95)
-    parser.add_argument("--merge-min-distance", type=float, default=35.0)
-    parser.add_argument("--row-tolerance", type=float, default=None)
-    parser.add_argument("--no-row-filter", action="store_true")
-    parser.add_argument("--front-start", type=float, default=0.18)
-    parser.add_argument("--front-end", type=float, default=0.88)
-    parser.add_argument("--roi", type=parse_roi_string, default=None)
-    parser.add_argument("--select-roi", action="store_true")
-    parser.add_argument("--use-ellipse-fallback", action="store_true")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--show-coords", action="store_true")
-    parser.add_argument("--csv", type=Path, default=None)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("outputs"),
+        help="Output file for --image mode, or output folder for --folder mode.",
+    )
+
+    parser.add_argument("--max-width", type=int, default=1280, help="Resize images to this maximum width.")
+    parser.add_argument("--min-radius", type=int, default=20, help="Minimum rivet radius after resizing.")
+    parser.add_argument("--max-radius", type=int, default=50, help="Maximum rivet radius after resizing.")
+    parser.add_argument("--hough-votes", type=int, default=22, help="Higher = stricter circle detection.")
+    parser.add_argument("--multi-pass", action="store_true", help="Try several Hough settings for harder images.")
+    parser.add_argument("--score-threshold", type=float, default=0.06, help="Minimum detection score to keep.")
+    parser.add_argument("--merge-factor", type=float, default=0.95, help="NMS distance factor for merging duplicate circles.")
+    parser.add_argument("--merge-min-distance", type=float, default=35.0, help="Minimum NMS merge distance.")
+    parser.add_argument("--row-tolerance", type=float, default=None, help="Max distance from fitted rivet row.")
+    parser.add_argument("--no-row-filter", action="store_true", help="Disable row filtering.")
+
+    parser.add_argument(
+        "--front-start",
+        type=float,
+        default=0.18,
+        help="Start fraction of blue-object height used as rivet ROI.",
+    )
+    parser.add_argument(
+        "--front-end",
+        type=float,
+        default=0.88,
+        help="End fraction of blue-object height used as rivet ROI.",
+    )
+
+    parser.add_argument("--roi", type=parse_roi_string, default=None, help="Manual ROI as x,y,w,h after resizing.")
+    parser.add_argument("--select-roi", action="store_true", help="Use mouse to select ROI interactively.")
+    parser.add_argument("--use-ellipse-fallback", action="store_true", help="Also try contour/ellipse detection.")
+    parser.add_argument("--debug", action="store_true", help="Save intermediate processing images.")
+    parser.add_argument("--show-coords", action="store_true", help="Draw coordinate labels on output image.")
+    parser.add_argument("--csv", type=Path, default=None, help="Optional CSV file for detected centers.")
+
+    parser.add_argument("--ai-preprocess", action="store_true", help="Use optional AI/GPU preprocessing with PyTorch if available.")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Device for AI preprocessing.")
+
     return parser
 
 
@@ -438,26 +642,40 @@ def main() -> None:
         raise ValueError("--front-start and --front-end must be fractions between 0 and 1, with start < end.")
 
     results: list[DetectionResult] = []
+
     if args.image is not None:
         input_path = args.image
         if not input_path.exists():
             raise FileNotFoundError(f"Input image does not exist: {input_path}")
+
         if args.output.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
             output_path = args.output
         else:
             output_path = args.output / f"{input_path.stem}_detected.png"
+
         results.append(detect_rivets_in_image(input_path, output_path, args))
+
     else:
         input_folder = args.folder
         if not input_folder.exists():
             raise FileNotFoundError(f"Input folder does not exist: {input_folder}")
+
+        output_folder = args.output
         files = image_files_from_folder(input_folder)
         if not files:
             raise FileNotFoundError(f"No image files found in folder: {input_folder}")
-        for image_path in files:
-            results.append(detect_rivets_in_image(image_path, args.output / f"{image_path.stem}_detected.png", args))
 
-    csv_path = args.csv if args.csv is not None else (results[0].output_path.with_name(f"{results[0].image_path.stem}_centers.csv") if args.image is not None else args.output / "rivet_centers.csv")
+        for image_path in files:
+            output_path = output_folder / f"{image_path.stem}_detected.png"
+            results.append(detect_rivets_in_image(image_path, output_path, args))
+
+    csv_path = args.csv
+    if csv_path is None:
+        if args.image is not None:
+            csv_path = results[0].output_path.with_name(f"{results[0].image_path.stem}_centers.csv")
+        else:
+            csv_path = args.output / "rivet_centers.csv"
+
     write_centers_csv(csv_path, results)
     print(f"\nSaved center coordinates CSV: {csv_path}")
 
