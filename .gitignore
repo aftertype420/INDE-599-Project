@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Project-generated outputs
+rivet_project_shapes/
+outputs/
+runs/
+reports/*.csv
+reports/*.xlsx
+
+# Dataset and large local files
+dataset/
+data/
+Photos-3-circle/
+Photos-3-oval/
+Photos-3-damaged/
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.avi
+
+# Keep folders when desired
+!.gitkeep
